@@ -1,6 +1,8 @@
 import { execFile, spawn } from "child_process";
+import { randomUUID } from "crypto";
 import { promisify } from "util";
 import fs from "fs";
+import os from "os";
 import path from "path";
 import {
   closeMainWindow,
@@ -10,11 +12,6 @@ import {
 } from "@raycast/api";
 
 const execFileAsync = promisify(execFile);
-
-interface Preferences {
-  terminal: "windowsTerminal" | "pwsh" | "powershell" | "cmd";
-  claudeArgs: string;
-}
 
 /**
  * Raycast may carry a stale PATH (captured when its process started) and child
@@ -86,14 +83,101 @@ function psQuote(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
 }
 
+/**
+ * Splits the free-form claudeArgs preference into argv tokens, honouring
+ * double and single quotes so values with spaces survive intact
+ * (e.g. --add-dir "C:\My Projects").
+ */
+function splitArgs(input: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let quote: '"' | "'" | null = null;
+  let inToken = false;
+  for (const ch of input) {
+    if (quote) {
+      if (ch === quote) quote = null;
+      else current += ch;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+      inToken = true;
+    } else if (/\s/.test(ch)) {
+      if (inToken) tokens.push(current);
+      current = "";
+      inToken = false;
+    } else {
+      current += ch;
+      inToken = true;
+    }
+  }
+  if (inToken) tokens.push(current);
+  return tokens;
+}
+
+/**
+ * Quotes one argument for the cmd branch. Wrapping in double quotes keeps
+ * whitespace and metacharacters (& | ; ...) literal; embedded double quotes
+ * are dropped because they are illegal in Windows paths and cannot be
+ * escaped reliably through cmd's start.
+ */
+function cmdQuote(value: string): string {
+  const cleaned = value.replace(/"/g, "");
+  return cleaned === "" || /[\s&|<>^()%!;=,]/.test(cleaned)
+    ? `"${cleaned}"`
+    : cleaned;
+}
+
+const LAUNCH_SCRIPT_PREFIX = "claude-code-projects-launch-";
+
+/**
+ * A literal % cannot be escaped on the cmd command line: quoting does not
+ * stop %NAME% expansion and %% only escapes inside batch scripts — and here
+ * the command would cross two cmd layers (the outer `cmd /s /c "start ..."`
+ * plus the inner `cmd /k`). Writing the claude call to a batch file, where
+ * %% reliably yields a literal %, keeps the arguments out of both parsers.
+ *
+ * Each launch gets its own file so overlapping launches cannot overwrite one
+ * another before the (asynchronous) inner cmd reads the script. Scripts from
+ * past launches are deleted after a day — long enough that their sessions
+ * have read them, since cmd only re-reads the file after claude exits.
+ */
+function writeCmdLaunchScript(claudeCall: string): string {
+  const dir = os.tmpdir();
+  try {
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    for (const name of fs.readdirSync(dir)) {
+      if (!name.startsWith(LAUNCH_SCRIPT_PREFIX) || !name.endsWith(".cmd")) {
+        continue;
+      }
+      const full = path.join(dir, name);
+      try {
+        if (fs.statSync(full).mtimeMs < cutoff) fs.unlinkSync(full);
+      } catch {
+        // already gone or inaccessible — cleanup is best-effort
+      }
+    }
+  } catch {
+    // cleanup is best-effort
+  }
+  const scriptPath = path.join(
+    dir,
+    `${LAUNCH_SCRIPT_PREFIX}${randomUUID()}.cmd`,
+  );
+  fs.writeFileSync(
+    scriptPath,
+    `@echo off\r\n${claudeCall.replace(/%/g, "%%")}\r\n`,
+  );
+  return scriptPath;
+}
+
 function encodedStartupScript(
   realPathString: string,
   claudeExe: string | null,
   args: string[],
 ): string {
+  const quotedArgs = args.map(psQuote).join(" ");
   const claudeCall = claudeExe
-    ? `& ${psQuote(claudeExe)} ${args.join(" ")}`.trim()
-    : ["claude", ...args].join(" ");
+    ? `& ${psQuote(claudeExe)} ${quotedArgs}`.trim()
+    : `claude ${quotedArgs}`.trim();
   const script = [
     `$env:Path = ${psQuote(realPathString)}`,
     "if (Test-Path $PROFILE) { . $PROFILE }",
@@ -169,11 +253,7 @@ export async function launchClaude(
   if (cwd.includes('"')) return; // invalid Windows path; avoids breaking the shell
 
   const { terminal, claudeArgs } = getPreferenceValues<Preferences>();
-  const extra = (claudeArgs ?? "")
-    .replace(/["'\r\n]/g, "")
-    .split(/\s+/)
-    .filter(Boolean);
-  const args = [...baseArgs, ...extra];
+  const args = [...baseArgs, ...splitArgs(claudeArgs ?? "")];
 
   const pathString = await realPath();
   const claudeExe = findClaude(pathString);
@@ -203,10 +283,18 @@ export async function launchClaude(
       );
       break;
     case "cmd": {
-      const claudeCall = claudeExe
-        ? `"${claudeExe}" ${args.join(" ")}`.trim()
-        : ["claude", ...args].join(" ");
-      runInNewWindow(`cmd /k ${claudeCall}`, cwd, env, "cmd not found.");
+      const claudeCall = [
+        claudeExe ? cmdQuote(claudeExe) : "claude",
+        ...args.map(cmdQuote),
+      ].join(" ");
+      let script: string;
+      try {
+        script = writeCmdLaunchScript(claudeCall);
+      } catch {
+        onFail("Could not write the launch script to the temp folder.")();
+        return;
+      }
+      runInNewWindow(`cmd /k "${script}"`, cwd, env, "cmd not found.");
       break;
     }
     case "windowsTerminal":
