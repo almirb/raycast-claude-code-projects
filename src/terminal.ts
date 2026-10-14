@@ -21,10 +21,28 @@ const execFileAsync = promisify(execFile);
  * reg.exe, claude is located on it, and the launched shells only receive
  * ready-made literal strings.
  */
-function expandEnvRefs(value: string): string {
+const MACHINE_ENV_KEY =
+  "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment";
+const USER_ENV_KEY = "HKCU\\Environment";
+
+/**
+ * Copies of process.env are plain objects, so lookups must ignore case
+ * themselves, as Windows does.
+ */
+function findKey(env: NodeJS.ProcessEnv, name: string): string | undefined {
+  const upper = name.toUpperCase();
+  return Object.keys(env).find((key) => key.toUpperCase() === upper);
+}
+
+function getVar(env: NodeJS.ProcessEnv, name: string): string {
+  const key = findKey(env, name);
+  return (key && env[key]) || "";
+}
+
+function expandEnvRefs(value: string, env: NodeJS.ProcessEnv): string {
   return value.replace(
-    /%([^%]+)%/g,
-    (match, name: string) => process.env[name] ?? match,
+    /%([^%;]+)%/g,
+    (match, name: string) => getVar(env, name) || match,
   );
 }
 
@@ -32,52 +50,76 @@ function system32(exe: string): string {
   return path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", exe);
 }
 
-async function regPath(key: string): Promise<string> {
+/** All string values of a registry environment key, still unexpanded. */
+async function regEnv(key: string): Promise<[string, string][]> {
   try {
     // Absolute path on purpose: resolving "reg" depends on the very PATH this
     // function exists to repair, and it is missing in Raycast's environment.
-    const { stdout } = await execFileAsync(system32("reg.exe"), [
-      "query",
-      key,
-      "/v",
-      "Path",
-    ]);
-    const match = /\bPath\s+REG(?:_EXPAND)?_SZ\s+(.+)/i.exec(stdout);
-    return match ? expandEnvRefs(match[1].trim()) : "";
+    const { stdout } = await execFileAsync(system32("reg.exe"), ["query", key]);
+    return [
+      ...stdout.matchAll(/^ {4}(.+?) {4}REG_(?:EXPAND_)?SZ {4}(.*?)\r?$/gm),
+    ].map((match): [string, string] => [match[1], match[2].trim()]);
   } catch {
-    return "";
+    return [];
   }
 }
 
-async function realPath(): Promise<string> {
-  const [machine, user] = await Promise.all([
-    regPath(
-      "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
-    ),
-    regPath("HKCU\\Environment"),
-  ]);
-  const combined =
-    [machine, user].filter(Boolean).join(";") || (process.env.PATH ?? "");
+/**
+ * Variables of Raycast's extension runtime. They mean nothing to a terminal
+ * and can change the behaviour of Node tools run inside it.
+ *
+ * Raycast's environment can also carry a Windows BCP-47 locale tag (e.g.
+ * "pt-BR-u-ca-gregory-...") in LC_ALL/LANG. POSIX tools spawned inside the
+ * session (like Git's bash) reject that format with a warning on every
+ * command, and a terminal opened by the user never defines these vars — so
+ * they are dropped instead of forwarded.
+ */
+const RUNTIME_VARS = new Set([
+  "EXTENSION_NAME",
+  "COMMAND_NAME",
+  "ASSETS_PATH",
+  "SUPPORT_PATH",
+  "FAVICON_PROVIDER",
+  "NODE_PATH",
+  "NODE_ENV",
+  "LANG",
+]);
 
-  // Safety net in case the registry read fails in the Raycast context: System32
-  // (without it not even cmd.exe resolves) plus the default install locations
-  // of oh-my-posh (winget), claude (native), npm and VS Code's CLI.
-  const programs = path.join(process.env.LOCALAPPDATA ?? "", "Programs");
-  const wellKnown = [
-    system32(""),
-    path.join(programs, "oh-my-posh", "bin"),
-    path.join(programs, "Microsoft VS Code", "bin"),
-    path.join(process.env.USERPROFILE ?? "", ".local", "bin"),
-    path.join(process.env.APPDATA ?? "", "npm"),
-  ].filter((dir) => dir.length > 3 && fs.existsSync(dir));
+function isRuntimeVar(name: string): boolean {
+  const upper = name.toUpperCase();
+  return (
+    RUNTIME_VARS.has(upper) ||
+    upper.startsWith("RAYCAST") ||
+    upper.startsWith("LC_")
+  );
+}
 
-  const present = new Set(
-    combined.split(";").map((d) => d.trim().replace(/\\+$/, "").toLowerCase()),
-  );
-  const missing = wellKnown.filter(
-    (d) => !present.has(d.replace(/\\+$/, "").toLowerCase()),
-  );
-  return missing.length > 0 ? `${combined};${missing.join(";")}` : combined;
+/**
+ * Machine-wide variables Windows defines in every user session but that are
+ * stored outside the Environment registry keys. Without ProgramData, for
+ * example, OpenSSH aborts with status 255 before printing anything. These are
+ * the well-known locations on the system drive.
+ */
+function machineEnvDefaults(systemRoot: string): [string, string][] {
+  const drive = systemRoot.slice(0, 2);
+  const programFiles = `${drive}\\Program Files`;
+  const programFilesX86 = `${drive}\\Program Files (x86)`;
+  const programData = `${drive}\\ProgramData`;
+  return [
+    ["SystemRoot", systemRoot],
+    ["windir", systemRoot],
+    ["SystemDrive", drive],
+    ["ProgramData", programData],
+    ["ALLUSERSPROFILE", programData],
+    ["ProgramFiles", programFiles],
+    ["ProgramW6432", programFiles],
+    ["ProgramFiles(x86)", programFilesX86],
+    ["CommonProgramFiles", path.join(programFiles, "Common Files")],
+    ["CommonProgramW6432", path.join(programFiles, "Common Files")],
+    ["CommonProgramFiles(x86)", path.join(programFilesX86, "Common Files")],
+    ["PUBLIC", `${drive}\\Users\\Public`],
+    ["COMPUTERNAME", os.hostname().toUpperCase()],
+  ];
 }
 
 function findClaude(pathString: string): string | null {
@@ -107,6 +149,7 @@ function psQuote(value: string): string {
 function essentialEnvDefaults(profile: string): [string, string][] {
   const local = path.join(profile, "AppData", "Local");
   return [
+    ["USERPROFILE", profile],
     ["APPDATA", path.join(profile, "AppData", "Roaming")],
     ["LOCALAPPDATA", local],
     ["TEMP", path.join(local, "Temp")],
@@ -114,36 +157,93 @@ function essentialEnvDefaults(profile: string): [string, string][] {
   ];
 }
 
+interface SessionEnv {
+  env: NodeJS.ProcessEnv;
+  /** Runtime variables dropped from Raycast's environment. */
+  removed: string[];
+  /** Variables Raycast's environment missed or carried empty, as restored. */
+  restored: [string, string][];
+}
+
 /**
  * Environment handed to every process launched from here — terminals and the
- * editor alike, since VS Code passes it on to its integrated terminal.
+ * editor alike, since VS Code passes it on to its integrated terminal. Windows
+ * Terminal also hands it to every tab later opened with its "+" button, so it
+ * must be as complete as the one Explorer gives a terminal opened by the user.
  */
-function launchEnv(pathString: string): NodeJS.ProcessEnv {
+async function sessionEnv(): Promise<SessionEnv> {
+  const [machineVars, userVars] = await Promise.all([
+    regEnv(MACHINE_ENV_KEY),
+    regEnv(USER_ENV_KEY),
+  ]);
+
   const env = { ...process.env };
-  delete env.PATH;
-  env.Path = pathString;
+  const removed = Object.keys(env).filter(isRuntimeVar);
+  for (const key of removed) delete env[key];
 
-  // Raycast's environment can carry a Windows BCP-47 locale tag (e.g.
-  // "pt-BR-u-ca-gregory-...") in LC_ALL/LANG. POSIX tools spawned inside the
-  // session (like Git's bash) reject that format with a warning on every
-  // command, and a terminal opened by the user never defines these vars — so
-  // drop them instead of forwarding.
-  for (const key of Object.keys(env)) {
-    if (key === "LANG" || key.startsWith("LC_")) delete env[key];
+  // Fill what is missing or empty, never overriding a value Raycast carries.
+  // Precedence follows Windows: user variables, then machine variables, then
+  // the well-known defaults for those stored elsewhere.
+  const systemRoot =
+    getVar(env, "SystemRoot") || getVar(env, "windir") || "C:\\Windows";
+  const profile = getVar(env, "USERPROFILE") || os.homedir();
+  const candidates = [
+    ...userVars,
+    ...machineVars,
+    ...machineEnvDefaults(systemRoot),
+    ...essentialEnvDefaults(profile),
+  ].filter(([name]) => name.toUpperCase() !== "PATH");
+  const restoredNames = new Set<string>();
+  for (const [name, value] of candidates) {
+    const key = findKey(env, name);
+    if (key && env[key]) continue;
+    if (key) delete env[key];
+    env[name] = value;
+    restoredNames.add(name);
+  }
+  // Registry values may reference each other (%SystemRoot%, %USERPROFILE%),
+  // so they are expanded only once every variable is in place.
+  for (const name of restoredNames) {
+    env[name] = expandEnvRefs(env[name] ?? "", env);
   }
 
-  // Restore essential vars that Raycast's environment may miss entirely or
-  // carry empty. Never overrides an existing non-empty value.
-  const profile = env.USERPROFILE || os.homedir();
-  for (const [name, value] of essentialEnvDefaults(profile)) {
-    const existing = Object.keys(env).find(
-      (k) => k.toUpperCase() === name.toUpperCase(),
+  const regPath = (vars: [string, string][]) =>
+    expandEnvRefs(
+      vars.find(([name]) => name.toUpperCase() === "PATH")?.[1] ?? "",
+      env,
     );
-    if (!existing) env[name] = value;
-    else if (!env[existing]) env[existing] = value;
-  }
+  const combined =
+    [regPath(machineVars), regPath(userVars)].filter(Boolean).join(";") ||
+    expandEnvRefs(process.env.PATH ?? "", env);
 
-  return env;
+  // Safety net in case the registry read fails in the Raycast context: System32
+  // (without it not even cmd.exe resolves) plus the default install locations
+  // of oh-my-posh (winget), claude (native), npm and VS Code's CLI.
+  const programs = path.join(getVar(env, "LOCALAPPDATA"), "Programs");
+  const wellKnown = [
+    path.join(systemRoot, "System32"),
+    path.join(programs, "oh-my-posh", "bin"),
+    path.join(programs, "Microsoft VS Code", "bin"),
+    path.join(getVar(env, "USERPROFILE"), ".local", "bin"),
+    path.join(getVar(env, "APPDATA"), "npm"),
+  ].filter((dir) => dir.length > 3 && fs.existsSync(dir));
+
+  const present = new Set(
+    combined.split(";").map((d) => d.trim().replace(/\\+$/, "").toLowerCase()),
+  );
+  const missing = wellKnown.filter(
+    (d) => !present.has(d.replace(/\\+$/, "").toLowerCase()),
+  );
+
+  const pathKey = findKey(env, "PATH");
+  if (pathKey) delete env[pathKey];
+  env.Path = missing.length > 0 ? `${combined};${missing.join(";")}` : combined;
+
+  return {
+    env,
+    removed,
+    restored: [...restoredNames].map((name) => [name, env[name] ?? ""]),
+  };
 }
 
 /**
@@ -358,26 +458,25 @@ function runInNewWindow(
  */
 function runInTerminalTab(
   cwd: string,
-  pathString: string,
   claudeExe: string | null,
   args: string[],
-  env: NodeJS.ProcessEnv,
+  session: SessionEnv,
 ): void {
+  const { env, removed, restored } = session;
   const claudeCall = [
     claudeExe ? cmdQuote(claudeExe) : "claude",
     ...args.map(cmdQuote),
   ].join(" ");
   let script: string;
   try {
-    // LANG/LC_ALL cleared and essential vars restored for the same reason
-    // they are fixed in the spawn env in launchClaude — the attached tab
+    // Runtime vars cleared and missing vars restored for the same reason
+    // they are fixed in the spawn env in sessionEnv — the attached tab
     // inherits the hosting window's environment, not the spawn env.
-    const profile = env.USERPROFILE || os.homedir();
+    const cleared = new Set(["LANG", "LC_ALL", ...removed]);
     script = writeCmdLaunchScript([
-      `set "Path=${pathString}"`,
-      'set "LANG="',
-      'set "LC_ALL="',
-      ...essentialEnvDefaults(profile).map(
+      `set "Path=${env.Path ?? ""}"`,
+      ...[...cleared].map((name) => `set "${name}="`),
+      ...restored.map(
         ([name, value]) => `if not defined ${name} set "${name}=${value}"`,
       ),
       claudeCall,
@@ -414,11 +513,11 @@ export async function launchClaude(
   const { terminal, claudeArgs } = getPreferenceValues<Preferences>();
   const args = [...baseArgs, ...splitArgs(claudeArgs ?? "")];
 
-  const pathString = await realPath();
+  const session = await sessionEnv();
+  const { env } = session;
+  const pathString = env.Path ?? "";
   const claudeExe = findClaude(pathString);
   const encoded = encodedStartupScript(pathString, claudeExe, args);
-
-  const env = launchEnv(pathString);
 
   await closeMainWindow();
 
@@ -456,13 +555,13 @@ export async function launchClaude(
     }
     case "windowsTerminal":
     default:
-      runInTerminalTab(cwd, pathString, claudeExe, args, env);
+      runInTerminalTab(cwd, claudeExe, args, session);
       break;
   }
 }
 
 export async function openInVSCode(cwd: string): Promise<void> {
-  const env = launchEnv(await realPath());
+  const { env } = await sessionEnv();
   const fail = (detail: string) =>
     onFail(
       `${detail}. Make sure \`code\` works in a terminal.`,
