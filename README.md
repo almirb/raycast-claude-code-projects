@@ -35,6 +35,17 @@ Launching a terminal on Windows is a different problem, and the extension is bui
   - *Command Prompt (cmd) — new window*: same, with cmd.
 - **Extra Claude Arguments** — appended to every `claude` invocation (e.g. `--model opus`).
 
+## Development
+
+On Windows, `ray develop` (`npm run dev`) writes the built extension to `~\.config\raycast-x\extensions`, while Raycast for Windows loads extensions from `~\.config\raycast\extensions`. The command then opens with "Missing executable. You might need to build the extension." The `RAY_Target` variable cannot fix this: the CLI uses its value as the folder suffix, so no value resolves to `raycast`.
+
+Once per machine, before the first `npm run dev`, point the CLI folder to the one Raycast reads:
+
+```powershell
+Remove-Item "$HOME\.config\raycast-x" -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Junction -Path "$HOME\.config\raycast-x" -Target "$HOME\.config\raycast"
+```
+
 ## Notes
 
 The extension resolves the `claude` executable and the system PATH from the Windows registry at launch time, so it works even when Raycast was started with a stale environment (a common issue for GUI apps on Windows).
